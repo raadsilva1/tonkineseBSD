@@ -13,6 +13,8 @@ typeset -g TARGET_USER=""
 typeset -g TARGET_HOME=""
 typeset -g TARGET_GROUP=""
 typeset -g TARGET_USER_OVERRIDE=""
+typeset -g TARGET_WALLPAPER_BASENAME=""
+typeset -g TARGET_WALLPAPER_PATH=""
 
 typeset -gi SHOW_HELP=0
 typeset -gi USE_SNAPSHOT_REPO=0
@@ -22,6 +24,7 @@ typeset -g PKG_TERMINAL_STEM=""
 typeset -g PKG_BROWSER_STEM=""
 typeset -g PKG_FILE_MANAGER_STEM=""
 typeset -g PKG_IMAGE_STEM=""
+typeset -g PKG_FEH_STEM=""
 typeset -g PKG_PDF_STEM=""
 typeset -g PKG_MEDIA_STEM=""
 typeset -g PKG_ARCHIVE_STEM=""
@@ -77,6 +80,10 @@ script_path() {
     print -r -- "${PWD:A}/$self"
 }
 
+wallpaper_extensions_text() {
+    print -r -- ".jpg, .jpeg, .png, .gif, .bmp, .tif, .tiff, .webp"
+}
+
 print_usage() {
     local prog="${0:t}"
 
@@ -85,8 +92,9 @@ $PROJECT prepares a default multimedia desktop experience on OpenBSD.
 
 It installs and validates the required desktop pieces for a regular user,
 including xenodm, emwm, browser, terminal, file browsing, image/PDF/media
-tools, sound service setup, recording permissions, firmware refresh, and the
-managed user session files needed to start the desktop cleanly.
+tools, sound service setup, recording permissions, firmware refresh, the
+managed user session files needed to start the desktop cleanly, and optional
+persistent wallpaper selection through feh.
 
 Usage:
   $prog [options]
@@ -105,12 +113,22 @@ Supported arguments:
 
       Automatic discovery remains the default when this option is not given.
 
+  -w, --wallpaper NAME
+      Persist the desktop wallpaper using NAME as the file base name only,
+      without an extension. The script resolves the image inside the selected
+      desktop user's ~/Wallpapers/ folder, installs feh, and keeps the managed
+      session startup applying that wallpaper on future graphical logins.
+
+      Supported wallpaper extensions are resolved case-insensitively:
+      $(wallpaper_extensions_text)
+
 Invocation notes:
   - This script only works on OpenBSD.
   - Root access is required for system changes.
   - If you run it as a normal user, it will re-run itself through doas.
   - If no target user is specified, the script tries to discover a suitable
     regular desktop user automatically.
+  - The wallpaper option accepts only the file name base, not a full path.
   - Progress and command output are written to a log file in /var/tmp.
 
 Examples:
@@ -121,12 +139,21 @@ Examples:
   $prog --user raad
       Run the setup for the user "raad" instead of auto-detecting the account.
 
+  $prog --wallpaper city-night
+      Resolve ~/Wallpapers/city-night with one supported image extension and
+      persist that wallpaper for future graphical sessions.
+
+  $prog --user raad --wallpaper "Rainy Evening"
+      Run the setup for user "raad" and persist ~/Wallpapers/Rainy Evening
+      using the single supported image file that matches that base name.
+
   $prog --snapshot
       Run the setup with snapshot package resolution everywhere the script uses
       OpenBSD package tools.
 
-  $prog --user raad --snapshot
-      Run the setup for user "raad" and force snapshot package mode.
+  $prog --user raad --snapshot --wallpaper city-night
+      Run the setup for user "raad", force snapshot package mode, and persist
+      the requested wallpaper.
 
   doas $prog --user raad --snapshot
       Run directly as root, with an explicit desktop target and snapshot mode.
@@ -138,6 +165,8 @@ Usability guidance:
   Run this on the OpenBSD machine you want to prepare.
   Use --user when you want to remove ambiguity and target one specific desktop
   account.
+  Use --wallpaper when you want tonkineseBSD to keep applying one image from
+  ~/Wallpapers/ automatically on future graphical logins.
   Use --snapshot only when you intentionally want snapshot package selection for
   all package-management operations performed by this script.
 EOF
@@ -162,6 +191,7 @@ parse_args() {
     SHOW_HELP=0
     USE_SNAPSHOT_REPO=0
     TARGET_USER_OVERRIDE=""
+    TARGET_WALLPAPER_BASENAME=""
 
     while [[ "$#" -gt 0 ]]; do
         arg="$1"
@@ -190,6 +220,24 @@ parse_args() {
                 fi
                 TARGET_USER_OVERRIDE="$value"
                 ;;
+            -w|--wallpaper)
+                shift
+                if [[ "$#" -eq 0 ]]; then
+                    usage_error "The wallpaper option requires a file name without extension."
+                fi
+                value="$1"
+                if [[ -z "$value" ]]; then
+                    usage_error "The wallpaper option requires a file name without extension."
+                fi
+                TARGET_WALLPAPER_BASENAME="$value"
+                ;;
+            --wallpaper=*)
+                value="${arg#--wallpaper=}"
+                if [[ -z "$value" ]]; then
+                    usage_error "The wallpaper option requires a file name without extension."
+                fi
+                TARGET_WALLPAPER_BASENAME="$value"
+                ;;
             --)
                 shift
                 break
@@ -204,7 +252,7 @@ parse_args() {
         shift
     done
 
-    if [[ "$#" -gt 0 ]]; then
+    if [[ "$#" -gt 0 ]]; do
         usage_error "This script does not accept extra values: $1"
     fi
 }
@@ -223,6 +271,99 @@ pkg_info_cmd() {
     else
         command pkg_info "$@"
     fi
+}
+
+validate_wallpaper_basename() {
+    local value="${1-}"
+    local lower_value=""
+
+    if [[ -z "$value" ]]; then
+        die "I could not use the requested wallpaper safely."
+    fi
+
+    if [[ "$value" == "." || "$value" == ".." ]]; then
+        die "Please pass the wallpaper file name without any path parts."
+    fi
+
+    if [[ "$value" == */* ]]; then
+        die "Please pass only the wallpaper file name without folders."
+    fi
+
+    if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+        die "Please pass the wallpaper file name on one clean line."
+    fi
+
+    lower_value="${value:l}"
+    case "$lower_value" in
+        *.jpg|*.jpeg|*.png|*.gif|*.bmp|*.tif|*.tiff|*.webp)
+            die "Please pass the wallpaper file name without the extension."
+            ;;
+    esac
+}
+
+resolve_requested_wallpaper() {
+    local base_name="${1-}"
+    local wallpapers_dir="$TARGET_HOME/Wallpapers"
+    local supported_extensions=""
+    local -a files
+    local -a matches
+    local file=""
+    local file_name=""
+    local file_stem=""
+    local file_ext=""
+    local lower_ext=""
+    local -a match_names
+
+    validate_wallpaper_basename "$base_name"
+    supported_extensions="$(wallpaper_extensions_text)"
+
+    if [[ ! -d "$wallpapers_dir" ]]; then
+        die "I could not find the Wallpapers folder for the selected desktop user."
+    fi
+
+    files=("$wallpapers_dir"/*(N))
+
+    for file in "${files[@]}"; do
+        [[ -f "$file" ]] || continue
+
+        file_name="${file:t}"
+        if [[ "$file_name" != *.* ]]; then
+            continue
+        fi
+
+        file_stem="${file_name%.*}"
+        file_ext="${file_name##*.}"
+        lower_ext="${file_ext:l}"
+
+        case "$lower_ext" in
+            jpg|jpeg|png|gif|bmp|tif|tiff|webp)
+                ;;
+            *)
+                continue
+                ;;
+        esac
+
+        if [[ "$file_stem" == "$base_name" ]]; then
+            matches+=("$file")
+        fi
+    done
+
+    if [[ "${#matches[@]}" -eq 0 ]]; then
+        die "I could not resolve that wallpaper inside ~/Wallpapers. Pass only the file name without extension and keep the image in one supported format."
+    fi
+
+    if [[ "${#matches[@]}" -gt 1 ]]; then
+        match_names=()
+        for file in "${matches[@]}"; do
+            match_names+=("${file:t}")
+        done
+        log_internal "WALLPAPER_AMBIGUOUS base=${(q)base_name} matches=${(j: :)match_names}"
+        die "I found more than one wallpaper with that base name inside ~/Wallpapers. Please keep only one supported image extension for it."
+    fi
+
+    local resolved_match="${matches[1]}"
+    log_internal "WALLPAPER_RESOLVED base=${(q)base_name} path=${(q)resolved_match} supported=${supported_extensions}"
+    print -r -- "$resolved_match"
 }
 
 ensure_root() {
@@ -619,6 +760,17 @@ prepare_recording_support() {
     ensure_persistent_sysctl kern.video.record 1
 }
 
+persist_wallpaper_selection() {
+    local file_path="$TARGET_HOME/.config/tonkineseBSD/session.conf"
+
+    if [[ -z "$TARGET_WALLPAPER_PATH" ]]; then
+        return 0
+    fi
+
+    rewrite_key_value_file "$file_path" "$TARGET_USER" "$TARGET_GROUP" 0644 \
+        TONKINESEBSD_WALLPAPER "${(q)TARGET_WALLPAPER_PATH}"
+}
+
 write_managed_xresources() {
     local file_path="$TARGET_HOME/.config/tonkineseBSD/Xresources"
 
@@ -653,6 +805,9 @@ write_managed_xsession() {
         printf '%s\n' 'if [[ -r "$HOME/.Xresources.local" ]]; then'
         printf '%s\n' '    xrdb -merge "$HOME/.Xresources.local" >/dev/null 2>&1'
         printf '%s\n' 'fi'
+        printf '%s\n' 'if [[ -r "$HOME/.config/tonkineseBSD/session.conf" ]]; then'
+        printf '%s\n' '    . "$HOME/.config/tonkineseBSD/session.conf"'
+        printf '%s\n' 'fi'
         printf '%s\n' 'if command -v -- xdg-user-dirs-update >/dev/null 2>&1; then'
         printf '%s\n' '    xdg-user-dirs-update >/dev/null 2>&1'
         printf '%s\n' 'fi'
@@ -667,7 +822,11 @@ write_managed_xsession() {
         printf '%s\n' '        fi'
         printf '%s\n' '    fi'
         printf '%s\n' 'fi'
-        printf '%s\n' 'xsetroot -solid "#1e232b" >/dev/null 2>&1'
+        printf '%s\n' 'if [[ -n "${TONKINESEBSD_WALLPAPER-}" && -r "$TONKINESEBSD_WALLPAPER" ]] && command -v -- feh >/dev/null 2>&1; then'
+        printf '%s\n' '    feh --no-fehbg --bg-fill "$TONKINESEBSD_WALLPAPER" >/dev/null 2>&1 || xsetroot -solid "#1e232b" >/dev/null 2>&1'
+        printf '%s\n' 'else'
+        printf '%s\n' '    xsetroot -solid "#1e232b" >/dev/null 2>&1'
+        printf '%s\n' 'fi'
         printf '%s\n' 'exec emwm'
     } | atomic_write_from_stdin "$file_path" "$TARGET_USER" "$TARGET_GROUP" 0755
 }
@@ -757,11 +916,13 @@ validate_video_stack() {
 final_validation() {
     local xenodm_status=""
     local sndiod_status=""
+    local wallpaper_config="$TARGET_HOME/.config/tonkineseBSD/session.conf"
 
     assert_pkg_installed "$PKG_EMWM_STEM"
     assert_pkg_installed "$PKG_BROWSER_STEM"
     assert_pkg_installed "$PKG_FILE_MANAGER_STEM"
     assert_pkg_installed "$PKG_IMAGE_STEM"
+    assert_pkg_installed "$PKG_FEH_STEM"
     assert_pkg_installed "$PKG_PDF_STEM"
     assert_pkg_installed "$PKG_MEDIA_STEM"
     assert_pkg_installed "$PKG_TERMINAL_STEM"
@@ -774,12 +935,30 @@ final_validation() {
         die "I stopped because the desktop session is not pointing to emwm."
     fi
 
+    if ! grep -q 'feh --no-fehbg --bg-fill' "$TARGET_HOME/.xsession" 2>>"$LOG_FILE"; then
+        die "I stopped because wallpaper startup support is missing."
+    fi
+
     if [[ ! -r "$TARGET_HOME/.config/tonkineseBSD/Xresources" ]]; then
         die "I stopped because the desktop defaults are missing."
     fi
 
     assert_owner "$TARGET_HOME/.xsession" "$TARGET_USER"
     assert_owner "$TARGET_HOME/.config/tonkineseBSD/Xresources" "$TARGET_USER"
+
+    if [[ -r "$wallpaper_config" ]]; then
+        assert_owner "$wallpaper_config" "$TARGET_USER"
+    fi
+
+    if [[ -n "$TARGET_WALLPAPER_PATH" ]]; then
+        if [[ ! -r "$wallpaper_config" ]]; then
+            die "I stopped because the wallpaper preference file is missing."
+        fi
+
+        if ! grep -q '^TONKINESEBSD_WALLPAPER=' "$wallpaper_config" 2>>"$LOG_FILE"; then
+            die "I stopped because the wallpaper preference was not saved."
+        fi
+    fi
 
     xenodm_status="$(rcctl get xenodm status 2>>"$LOG_FILE")" || xenodm_status=""
     if [[ "$xenodm_status" != "on" ]]; then
@@ -815,7 +994,7 @@ main() {
     ensure_root "$@"
     prechecks
 
-    log_internal "ARGS snapshot=$USE_SNAPSHOT_REPO target_user_override=${TARGET_USER_OVERRIDE:-auto}"
+    log_internal "ARGS snapshot=$USE_SNAPSHOT_REPO target_user_override=${TARGET_USER_OVERRIDE:-auto} wallpaper_base=${TARGET_WALLPAPER_BASENAME:-none}"
 
     if (( USE_SNAPSHOT_REPO )); then
         say "Using OpenBSD snapshot repositories for package work"
@@ -849,13 +1028,23 @@ main() {
         die "I could not safely determine the home folder for the desktop user."
     fi
 
-    log_internal "TARGET_USER=$TARGET_USER TARGET_HOME=$TARGET_HOME TARGET_GROUP=$TARGET_GROUP"
+    if [[ -n "$TARGET_WALLPAPER_BASENAME" ]]; then
+        TARGET_WALLPAPER_PATH="$(resolve_requested_wallpaper "$TARGET_WALLPAPER_BASENAME")"
+        if [[ -z "$TARGET_WALLPAPER_PATH" ]]; then
+            die "I could not resolve the requested wallpaper safely."
+        fi
+    else
+        TARGET_WALLPAPER_PATH=""
+    fi
+
+    log_internal "TARGET_USER=$TARGET_USER TARGET_HOME=$TARGET_HOME TARGET_GROUP=$TARGET_GROUP TARGET_WALLPAPER_PATH=${TARGET_WALLPAPER_PATH:-none}"
 
     PKG_EMWM_STEM="$(ensure_role emwm critical "Installing the main desktop pieces" emwm)"
     PKG_TERMINAL_STEM="$(ensure_role terminal critical "Adding a comfortable terminal" xfce4-terminal)"
     PKG_BROWSER_STEM="$(ensure_role browser critical "Adding a web browser" firefox-esr mozilla-firefox)"
     PKG_FILE_MANAGER_STEM="$(ensure_role files critical "Adding file browsing" thunar pcmanfm-qt)"
     PKG_IMAGE_STEM="$(ensure_role images critical "Adding image viewing" nsxiv feh)"
+    PKG_FEH_STEM="$(ensure_role wallpaper critical "Adding wallpaper support" feh)"
     PKG_PDF_STEM="$(ensure_role pdf critical "Adding PDF viewing" mupdf xpdf)"
     PKG_MEDIA_STEM="$(ensure_role media critical "Adding media playback" mpv mplayer)"
     PKG_ARCHIVE_STEM="$(ensure_role archive optional "Adding everyday tools" xarchiver)"
@@ -878,6 +1067,11 @@ main() {
     for folder in Desktop Documents Downloads Music Pictures Videos; do
         ensure_dir "$TARGET_HOME/$folder" "$TARGET_USER" "$TARGET_GROUP" 0755
     done
+
+    if [[ -n "$TARGET_WALLPAPER_PATH" ]]; then
+        say "Saving your desktop background choice"
+        persist_wallpaper_selection
+    fi
 
     say "Making everything start correctly"
     write_managed_xresources
