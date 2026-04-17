@@ -12,6 +12,7 @@ typeset -g ZSH_BIN=""
 typeset -g TARGET_USER=""
 typeset -g TARGET_HOME=""
 typeset -g TARGET_GROUP=""
+typeset -g TARGET_USER_OVERRIDE=""
 
 typeset -gi SHOW_HELP=0
 typeset -gi USE_SNAPSHOT_REPO=0
@@ -99,29 +100,44 @@ Supported arguments:
       whole script lifecycle. This applies consistently to package searching,
       package resolution, installation checks, and package installation work.
 
+  -u, --user USER
+      Use USER as the desktop account target instead of automatic discovery.
+
+      Automatic discovery remains the default when this option is not given.
+
 Invocation notes:
   - This script only works on OpenBSD.
   - Root access is required for system changes.
   - If you run it as a normal user, it will re-run itself through doas.
-  - The target desktop user is selected automatically from the local machine.
+  - If no target user is specified, the script tries to discover a suitable
+    regular desktop user automatically.
   - Progress and command output are written to a log file in /var/tmp.
 
 Examples:
   $prog
-      Run the standard setup using the normal package repository behavior.
+      Run the standard setup using automatic user discovery and normal package
+      repository behavior.
+
+  $prog --user raad
+      Run the setup for the user "raad" instead of auto-detecting the account.
 
   $prog --snapshot
-      Run the same setup, but force snapshot package resolution everywhere the
-      script uses OpenBSD package tools.
+      Run the setup with snapshot package resolution everywhere the script uses
+      OpenBSD package tools.
 
-  doas $prog --snapshot
-      Run directly as root with snapshot package mode enabled.
+  $prog --user raad --snapshot
+      Run the setup for user "raad" and force snapshot package mode.
+
+  doas $prog --user raad --snapshot
+      Run directly as root, with an explicit desktop target and snapshot mode.
 
   $prog --help
       Show this help screen without making changes.
 
 Usability guidance:
   Run this on the OpenBSD machine you want to prepare.
+  Use --user when you want to remove ambiguity and target one specific desktop
+  account.
   Use --snapshot only when you intentionally want snapshot package selection for
   all package-management operations performed by this script.
 EOF
@@ -141,9 +157,11 @@ usage_error() {
 
 parse_args() {
     local arg=""
+    local value=""
 
     SHOW_HELP=0
     USE_SNAPSHOT_REPO=0
+    TARGET_USER_OVERRIDE=""
 
     while [[ "$#" -gt 0 ]]; do
         arg="$1"
@@ -153,6 +171,24 @@ parse_args() {
                 ;;
             -S|--snapshot|--snapshots)
                 USE_SNAPSHOT_REPO=1
+                ;;
+            -u|--user)
+                shift
+                if [[ "$#" -eq 0 ]]; then
+                    usage_error "The target user option requires a user name."
+                fi
+                value="$1"
+                if [[ -z "$value" ]]; then
+                    usage_error "The target user option requires a user name."
+                fi
+                TARGET_USER_OVERRIDE="$value"
+                ;;
+            --user=*)
+                value="${arg#--user=}"
+                if [[ -z "$value" ]]; then
+                    usage_error "The target user option requires a user name."
+                fi
+                TARGET_USER_OVERRIDE="$value"
                 ;;
             --)
                 shift
@@ -459,7 +495,17 @@ determine_target_user() {
 
 resolve_target_home() {
     local user="${1-}"
-    awk -F: -v u="$user" '$1 == u { print $9; exit }' /etc/passwd
+    local home=""
+
+    if [[ -r /etc/master.passwd ]]; then
+        home="$(awk -F: -v u="$user" '$1 == u { print $9; exit }' /etc/master.passwd)"
+    fi
+
+    if [[ -z "$home" && -r /etc/passwd ]]; then
+        home="$(awk -F: -v u="$user" '$1 == u { print $6; exit }' /etc/passwd)"
+    fi
+
+    print -r -- "$home"
 }
 
 resolve_pkg_exact() {
@@ -769,7 +815,7 @@ main() {
     ensure_root "$@"
     prechecks
 
-    log_internal "ARGS snapshot=$USE_SNAPSHOT_REPO"
+    log_internal "ARGS snapshot=$USE_SNAPSHOT_REPO target_user_override=${TARGET_USER_OVERRIDE:-auto}"
 
     if (( USE_SNAPSHOT_REPO )); then
         say "Using OpenBSD snapshot repositories for package work"
@@ -780,9 +826,16 @@ main() {
         die "I could not continue because the shell for this setup is missing."
     fi
 
-    TARGET_USER="$(determine_target_user)" || TARGET_USER=""
-    if [[ -z "$TARGET_USER" ]]; then
-        die "I could not safely determine which account should receive the desktop setup."
+    if [[ -n "$TARGET_USER_OVERRIDE" ]]; then
+        if ! is_human_user "$TARGET_USER_OVERRIDE"; then
+            die "I could not use the requested desktop user safely."
+        fi
+        TARGET_USER="$TARGET_USER_OVERRIDE"
+    else
+        TARGET_USER="$(determine_target_user)" || TARGET_USER=""
+        if [[ -z "$TARGET_USER" ]]; then
+            die "I could not safely determine which account should receive the desktop setup."
+        fi
     fi
 
     TARGET_HOME="$(resolve_target_home "$TARGET_USER")"
