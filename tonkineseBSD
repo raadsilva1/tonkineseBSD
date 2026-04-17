@@ -13,6 +13,9 @@ typeset -g TARGET_USER=""
 typeset -g TARGET_HOME=""
 typeset -g TARGET_GROUP=""
 
+typeset -gi SHOW_HELP=0
+typeset -gi USE_SNAPSHOT_REPO=0
+
 typeset -g PKG_EMWM_STEM=""
 typeset -g PKG_TERMINAL_STEM=""
 typeset -g PKG_BROWSER_STEM=""
@@ -71,6 +74,119 @@ script_path() {
     fi
 
     print -r -- "${PWD:A}/$self"
+}
+
+print_usage() {
+    local prog="${0:t}"
+
+    cat <<EOF
+$PROJECT prepares a default multimedia desktop experience on OpenBSD.
+
+It installs and validates the required desktop pieces for a regular user,
+including xenodm, emwm, browser, terminal, file browsing, image/PDF/media
+tools, sound service setup, recording permissions, firmware refresh, and the
+managed user session files needed to start the desktop cleanly.
+
+Usage:
+  $prog [options]
+
+Supported arguments:
+  -h, --help
+      Show this help text and exit cleanly.
+
+  -S, --snapshot
+      Force OpenBSD package commands to use snapshot repository mode for the
+      whole script lifecycle. This applies consistently to package searching,
+      package resolution, installation checks, and package installation work.
+
+Invocation notes:
+  - This script only works on OpenBSD.
+  - Root access is required for system changes.
+  - If you run it as a normal user, it will re-run itself through doas.
+  - The target desktop user is selected automatically from the local machine.
+  - Progress and command output are written to a log file in /var/tmp.
+
+Examples:
+  $prog
+      Run the standard setup using the normal package repository behavior.
+
+  $prog --snapshot
+      Run the same setup, but force snapshot package resolution everywhere the
+      script uses OpenBSD package tools.
+
+  doas $prog --snapshot
+      Run directly as root with snapshot package mode enabled.
+
+  $prog --help
+      Show this help screen without making changes.
+
+Usability guidance:
+  Run this on the OpenBSD machine you want to prepare.
+  Use --snapshot only when you intentionally want snapshot package selection for
+  all package-management operations performed by this script.
+EOF
+}
+
+usage_error() {
+    local msg="${1-}"
+
+    if [[ -n "$msg" ]]; then
+        log_internal "USAGE_ERROR $msg"
+        printf '%s\n\n' "$msg" >&2
+    fi
+
+    print_usage >&2
+    exit 1
+}
+
+parse_args() {
+    local arg=""
+
+    SHOW_HELP=0
+    USE_SNAPSHOT_REPO=0
+
+    while [[ "$#" -gt 0 ]]; do
+        arg="$1"
+        case "$arg" in
+            -h|--help)
+                SHOW_HELP=1
+                ;;
+            -S|--snapshot|--snapshots)
+                USE_SNAPSHOT_REPO=1
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -*)
+                usage_error "I did not understand the argument: $arg"
+                ;;
+            *)
+                usage_error "This script does not accept positional arguments: $arg"
+                ;;
+        esac
+        shift
+    done
+
+    if [[ "$#" -gt 0 ]]; then
+        usage_error "This script does not accept extra values: $1"
+    fi
+}
+
+pkg_add_cmd() {
+    if (( USE_SNAPSHOT_REPO )); then
+        command pkg_add -D snap "$@"
+    else
+        command pkg_add "$@"
+    fi
+}
+
+pkg_info_cmd() {
+    if (( USE_SNAPSHOT_REPO )); then
+        command pkg_info -D snap "$@"
+    else
+        command pkg_info "$@"
+    fi
 }
 
 ensure_root() {
@@ -347,7 +463,7 @@ resolve_pkg_exact() {
     local -a matches
     local match
 
-    matches_output="$(pkg_info -Q "$stem" 2>>"$LOG_FILE")" || return 1
+    matches_output="$(pkg_info_cmd -Q "$stem" 2>>"$LOG_FILE")" || return 1
     matches=("${(@f)matches_output}")
 
     for match in "${matches[@]}"; do
@@ -376,7 +492,7 @@ ensure_role() {
     candidates=("${@:4}")
 
     for stem in "${candidates[@]}"; do
-        if pkg_info -e "${stem}-*" >/dev/null 2>>"$LOG_FILE"; then
+        if pkg_info_cmd -e "${stem}-*" >/dev/null 2>>"$LOG_FILE"; then
             log_internal "ROLE $role already satisfied by $stem"
             print -r -- "$stem"
             return 0
@@ -390,8 +506,8 @@ ensure_role() {
         fi
 
         say "$friendly" >&2
-        if retry_run 3 3 "$friendly" -- pkg_add "$exact"; then
-            if pkg_info -e "${stem}-*" >/dev/null 2>>"$LOG_FILE"; then
+        if retry_run 3 3 "$friendly" -- pkg_add_cmd "$exact"; then
+            if pkg_info_cmd -e "${stem}-*" >/dev/null 2>>"$LOG_FILE"; then
                 log_internal "ROLE $role installed stem=$stem exact=$exact"
                 print -r -- "$stem"
                 return 0
@@ -512,7 +628,7 @@ assert_pkg_installed() {
         return 0
     fi
 
-    if ! pkg_info -e "${stem}-*" >/dev/null 2>>"$LOG_FILE"; then
+    if ! pkg_info_cmd -e "${stem}-*" >/dev/null 2>>"$LOG_FILE"; then
         die "I stopped because part of the desktop is still missing."
     fi
 }
@@ -637,9 +753,22 @@ final_validation() {
 }
 
 main() {
+    parse_args "$@"
+
+    if (( SHOW_HELP )); then
+        print_usage
+        return 0
+    fi
+
     prechecks
     ensure_root "$@"
     prechecks
+
+    log_internal "ARGS snapshot=$USE_SNAPSHOT_REPO"
+
+    if (( USE_SNAPSHOT_REPO )); then
+        say "Using OpenBSD snapshot repositories for package work"
+    fi
 
     ZSH_BIN="$(command -v -- zsh 2>/dev/null)" || ZSH_BIN=""
     if [[ -z "$ZSH_BIN" ]]; then
