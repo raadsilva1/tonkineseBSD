@@ -252,7 +252,7 @@ parse_args() {
         shift
     done
 
-    if [[ "$#" -gt 0 ]]; do
+    if [[ "$#" -gt 0 ]]; then
         usage_error "This script does not accept extra values: $1"
     fi
 }
