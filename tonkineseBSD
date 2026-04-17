@@ -457,6 +457,11 @@ determine_target_user() {
     return 1
 }
 
+resolve_target_home() {
+    local user="${1-}"
+    awk -F: -v u="$user" '$1 == u { print $9; exit }' /etc/passwd
+}
+
 resolve_pkg_exact() {
     local stem="${1-}"
     local matches_output=""
@@ -780,7 +785,7 @@ main() {
         die "I could not safely determine which account should receive the desktop setup."
     fi
 
-    TARGET_HOME="$(id -P "$TARGET_USER" | awk -F: '{print $9}')"
+    TARGET_HOME="$(resolve_target_home "$TARGET_USER")"
     TARGET_GROUP="$(id -gn "$TARGET_USER")"
 
     if [[ -z "$TARGET_HOME" ]]; then
