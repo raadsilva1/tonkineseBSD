@@ -37,7 +37,7 @@ log_internal() {
 }
 
 say() {
-    printf '%s\n' "• ${1-}"
+    printf '%s\n' "--> ${1-}"
 }
 
 die() {
@@ -288,9 +288,9 @@ retry_run() {
 }
 
 backup_file() {
-    local path="${1-}"
+    local file_path="${1-}"
 
-    if [[ ! -e "$path" ]]; then
+    if [[ ! -e "$file_path" ]]; then
         return 0
     fi
 
@@ -298,67 +298,67 @@ backup_file() {
     local backup
 
     stamp="$(date '+%Y%m%d-%H%M%S')"
-    backup="$path.tonkineseBSD.bak.$stamp"
+    backup="$file_path.tonkineseBSD.bak.$stamp"
 
-    cp -p "$path" "$backup" >> "$LOG_FILE" 2>&1 || die "I stopped to avoid damaging an existing file."
+    cp -p "$file_path" "$backup" >> "$LOG_FILE" 2>&1 || die "I stopped to avoid damaging an existing file."
 
-    log_internal "BACKUP $path -> $backup"
+    log_internal "BACKUP $file_path -> $backup"
 }
 
 ensure_dir() {
-    local path="${1-}"
+    local dir_path="${1-}"
     local owner="${2-}"
     local group="${3-}"
     local mode="${4-}"
 
-    if [[ -e "$path" ]]; then
-        if [[ ! -d "$path" ]]; then
+    if [[ -e "$dir_path" ]]; then
+        if [[ ! -d "$dir_path" ]]; then
             die "I stopped because a needed folder is blocked by something else."
         fi
 
-        chown "$owner:$group" "$path" >> "$LOG_FILE" 2>&1 || die "I could not prepare a needed folder."
-        chmod "$mode" "$path" >> "$LOG_FILE" 2>&1 || die "I could not prepare a needed folder."
+        chown "$owner:$group" "$dir_path" >> "$LOG_FILE" 2>&1 || die "I could not prepare a needed folder."
+        chmod "$mode" "$dir_path" >> "$LOG_FILE" 2>&1 || die "I could not prepare a needed folder."
         return 0
     fi
 
-    retry_run 2 1 "Preparing a folder" -- install -d -o "$owner" -g "$group" -m "$mode" "$path" \
+    retry_run 2 1 "Preparing a folder" -- install -d -o "$owner" -g "$group" -m "$mode" "$dir_path" \
         || die "I could not prepare a needed folder."
 }
 
 atomic_write_from_stdin() {
-    local path="${1-}"
+    local file_path="${1-}"
     local owner="${2-}"
     local group="${3-}"
     local mode="${4-}"
-    local dir
+    local dir_path
     local tmp
 
-    dir="$(dirname "$path")"
+    dir_path="$(dirname "$file_path")"
 
-    if [[ -e "$dir" ]]; then
-        if [[ ! -d "$dir" ]]; then
+    if [[ -e "$dir_path" ]]; then
+        if [[ ! -d "$dir_path" ]]; then
             die "I stopped because a needed folder is blocked by something else."
         fi
     else
         die "I stopped because a needed folder is missing."
     fi
 
-    tmp="$(mktemp "$dir/.tonkineseBSD.XXXXXX")" || die "I could not prepare a safe temporary file."
+    tmp="$(mktemp "$dir_path/.tonkineseBSD.XXXXXX")" || die "I could not prepare a safe temporary file."
 
     if ! cat > "$tmp"; then
         rm -f "$tmp"
         die "I could not prepare a safe file update."
     fi
 
-    if [[ -e "$path" ]]; then
-        if cmp -s "$tmp" "$path"; then
-            chown "$owner:$group" "$path" >> "$LOG_FILE" 2>&1
-            chmod "$mode" "$path" >> "$LOG_FILE" 2>&1
+    if [[ -e "$file_path" ]]; then
+        if cmp -s "$tmp" "$file_path"; then
+            chown "$owner:$group" "$file_path" >> "$LOG_FILE" 2>&1
+            chmod "$mode" "$file_path" >> "$LOG_FILE" 2>&1
             rm -f "$tmp"
             return 0
         fi
 
-        backup_file "$path"
+        backup_file "$file_path"
     fi
 
     chown "$owner:$group" "$tmp" >> "$LOG_FILE" 2>&1 || {
@@ -371,33 +371,33 @@ atomic_write_from_stdin() {
         die "I could not set file permissions safely."
     }
 
-    mv -f "$tmp" "$path" >> "$LOG_FILE" 2>&1 || {
+    mv -f "$tmp" "$file_path" >> "$LOG_FILE" 2>&1 || {
         rm -f "$tmp"
         die "I could not finish a safe file update."
     }
 }
 
 rewrite_key_value_file() {
-    local path="${1-}"
+    local file_path="${1-}"
     local owner="${2-}"
     local group="${3-}"
     local mode="${4-}"
     local key="${5-}"
     local value="${6-}"
-    local dir
+    local dir_path
     local tmp
 
-    dir="$(dirname "$path")"
-    tmp="$(mktemp "$dir/.tonkineseBSD.kv.XXXXXX")" || die "I could not prepare a safe temporary file."
+    dir_path="$(dirname "$file_path")"
+    tmp="$(mktemp "$dir_path/.tonkineseBSD.kv.XXXXXX")" || die "I could not prepare a safe temporary file."
 
-    if [[ -e "$path" ]]; then
+    if [[ -e "$file_path" ]]; then
         awk -v key="$key" '
             BEGIN {
                 pattern = "^[[:space:]]*" key "[[:space:]]*="
             }
             $0 ~ pattern { next }
             { print }
-        ' "$path" > "$tmp" || {
+        ' "$file_path" > "$tmp" || {
             rm -f "$tmp"
             die "I could not prepare a safe file update."
         }
@@ -413,14 +413,14 @@ rewrite_key_value_file() {
         die "I could not prepare a safe file update."
     }
 
-    if [[ -e "$path" ]]; then
-        if cmp -s "$tmp" "$path"; then
-            chown "$owner:$group" "$path" >> "$LOG_FILE" 2>&1
-            chmod "$mode" "$path" >> "$LOG_FILE" 2>&1
+    if [[ -e "$file_path" ]]; then
+        if cmp -s "$tmp" "$file_path"; then
+            chown "$owner:$group" "$file_path" >> "$LOG_FILE" 2>&1
+            chmod "$mode" "$file_path" >> "$LOG_FILE" 2>&1
             rm -f "$tmp"
             return 0
         fi
-        backup_file "$path"
+        backup_file "$file_path"
     fi
 
     chown "$owner:$group" "$tmp" >> "$LOG_FILE" 2>&1 || {
@@ -433,7 +433,7 @@ rewrite_key_value_file() {
         die "I could not set file permissions safely."
     }
 
-    mv -f "$tmp" "$path" >> "$LOG_FILE" 2>&1 || {
+    mv -f "$tmp" "$file_path" >> "$LOG_FILE" 2>&1 || {
         rm -f "$tmp"
         die "I could not finish a safe file update."
     }
@@ -620,7 +620,7 @@ prepare_recording_support() {
 }
 
 write_managed_xresources() {
-    local path="$TARGET_HOME/.config/tonkineseBSD/Xresources"
+    local file_path="$TARGET_HOME/.config/tonkineseBSD/Xresources"
 
     {
         printf '%s\n' '! Managed by tonkineseBSD'
@@ -635,11 +635,11 @@ write_managed_xresources() {
         printf '%s\n' 'XTerm*pointerColorForeground: #e6e6e6'
         printf '%s\n' 'XTerm*metaSendsEscape: true'
         printf '%s\n' 'XTerm*selectToClipboard: true'
-    } | atomic_write_from_stdin "$path" "$TARGET_USER" "$TARGET_GROUP" 0644
+    } | atomic_write_from_stdin "$file_path" "$TARGET_USER" "$TARGET_GROUP" 0644
 }
 
 write_managed_xsession() {
-    local path="$TARGET_HOME/.xsession"
+    local file_path="$TARGET_HOME/.xsession"
 
     {
         printf '%s\n' "#!$ZSH_BIN"
@@ -669,7 +669,7 @@ write_managed_xsession() {
         printf '%s\n' 'fi'
         printf '%s\n' 'xsetroot -solid "#1e232b" >/dev/null 2>&1'
         printf '%s\n' 'exec emwm'
-    } | atomic_write_from_stdin "$path" "$TARGET_USER" "$TARGET_GROUP" 0755
+    } | atomic_write_from_stdin "$file_path" "$TARGET_USER" "$TARGET_GROUP" 0755
 }
 
 assert_pkg_installed() {
@@ -685,11 +685,11 @@ assert_pkg_installed() {
 }
 
 assert_owner() {
-    local path="${1-}"
+    local file_path="${1-}"
     local expected_user="${2-}"
     local actual_user
 
-    actual_user="$(stat -f %Su "$path" 2>>"$LOG_FILE")" || actual_user=""
+    actual_user="$(stat -f %Su "$file_path" 2>>"$LOG_FILE")" || actual_user=""
     if [[ "$actual_user" != "$expected_user" ]]; then
         die "I stopped because a user file ended up with the wrong ownership."
     fi
