@@ -1,0 +1,652 @@
+#!/usr/local/bin/fish
+set -gx PATH /usr/local/bin /usr/X11R6/bin /bin /usr/bin /sbin /usr/sbin
+umask 022
+
+set -g PROJECT tonkineseBSD
+set -g MARKER "# Managed by tonkineseBSD"
+set -g LOG_FILE "/var/tmp/tonkineseBSD-"(date "+%Y%m%d-%H%M%S")".log"
+touch "$LOG_FILE" 2>/dev/null
+
+function log_internal
+    set -l msg (string join " " -- $argv)
+    printf '%s %s\n' (date "+%Y-%m-%d %H:%M:%S") "$msg" >> "$LOG_FILE"
+end
+
+function say
+    printf '%s\n' "• $argv[1]"
+end
+
+function die
+    set -l msg $argv[1]
+    log_internal "FATAL $msg"
+    printf '%s\n' "$msg" 1>&2
+    exit 1
+end
+
+function need_cmd
+    set -l cmd $argv[1]
+    if not command -sq "$cmd"
+        die "I could not continue because something essential is missing."
+    end
+end
+
+function script_path
+    set -l self (status filename)
+    if string match -rq '^/' -- "$self"
+        echo "$self"
+        return 0
+    end
+
+    set -l resolved (command -s "$self" 2>/dev/null)
+    if test -n "$resolved"
+        echo "$resolved"
+        return 0
+    end
+
+    echo (pwd)"/$self"
+end
+
+function ensure_root
+    if test (id -u) -eq 0
+        return 0
+    end
+
+    need_cmd doas
+
+    set -l self (script_path)
+    set -l fish_bin (command -s fish 2>/dev/null)
+
+    if test -z "$fish_bin"
+        die "I could not continue because the shell for this setup is missing."
+    end
+
+    say "Getting permission to continue"
+    exec doas "$fish_bin" "$self" $argv
+end
+
+function prechecks
+    if test (uname -s) != OpenBSD
+        die "This setup only works on OpenBSD."
+    end
+
+    for cmd in id pkg_add pkg_info rcctl install mv cp chmod chown awk grep head cmp mktemp dirname date who rm sleep stat touch logname fw_update sysctl dmesg
+        need_cmd "$cmd"
+    end
+end
+
+function retry_run
+    set -l attempts $argv[1]
+    set -l delay_s $argv[2]
+    set -l friendly $argv[3]
+    set -l cmd $argv[5..-1]
+    set -l n 1
+
+    while test "$n" -le "$attempts"
+        log_internal "RUN attempt=$n friendly=$friendly cmd="(string join " " -- $cmd)
+        if $cmd >> "$LOG_FILE" 2>&1
+            return 0
+        end
+
+        set -l rc $status
+        log_internal "FAIL attempt=$n rc=$rc friendly=$friendly"
+
+        if test "$n" -lt "$attempts"
+            say "Trying that again"
+            sleep "$delay_s"
+        else
+            return $rc
+        end
+
+        set n (math "$n + 1")
+    end
+end
+
+function backup_file
+    set -l path $argv[1]
+
+    if not test -e "$path"
+        return 0
+    end
+
+    set -l stamp (date "+%Y%m%d-%H%M%S")
+    set -l backup "$path.tonkineseBSD.bak.$stamp"
+
+    cp -p "$path" "$backup" >> "$LOG_FILE" 2>&1
+    or die "I stopped to avoid damaging an existing file."
+
+    log_internal "BACKUP $path -> $backup"
+end
+
+function ensure_dir
+    set -l path $argv[1]
+    set -l owner $argv[2]
+    set -l group $argv[3]
+    set -l mode $argv[4]
+
+    if test -e "$path"
+        if not test -d "$path"
+            die "I stopped because a needed folder is blocked by something else."
+        end
+
+        chown "$owner:$group" "$path" >> "$LOG_FILE" 2>&1
+        or die "I could not prepare a needed folder."
+
+        chmod "$mode" "$path" >> "$LOG_FILE" 2>&1
+        or die "I could not prepare a needed folder."
+        return 0
+    end
+
+    retry_run 2 1 "Preparing a folder" -- install -d -o "$owner" -g "$group" -m "$mode" "$path"
+    or die "I could not prepare a needed folder."
+end
+
+function atomic_write_from_stdin
+    set -l path $argv[1]
+    set -l owner $argv[2]
+    set -l group $argv[3]
+    set -l mode $argv[4]
+    set -l dir (dirname "$path")
+
+    if test -e "$dir"
+        if not test -d "$dir"
+            die "I stopped because a needed folder is blocked by something else."
+        end
+    else
+        die "I stopped because a needed folder is missing."
+    end
+
+    set -l tmp (mktemp "$dir/.tonkineseBSD.XXXXXX")
+    or die "I could not prepare a safe temporary file."
+
+    cat > "$tmp"
+    or begin
+        rm -f "$tmp"
+        die "I could not prepare a safe file update."
+    end
+
+    if test -e "$path"
+        if cmp -s "$tmp" "$path"
+            chown "$owner:$group" "$path" >> "$LOG_FILE" 2>&1
+            chmod "$mode" "$path" >> "$LOG_FILE" 2>&1
+            rm -f "$tmp"
+            return 0
+        end
+
+        backup_file "$path"
+    end
+
+    chown "$owner:$group" "$tmp" >> "$LOG_FILE" 2>&1
+    or begin
+        rm -f "$tmp"
+        die "I could not set file ownership safely."
+    end
+
+    chmod "$mode" "$tmp" >> "$LOG_FILE" 2>&1
+    or begin
+        rm -f "$tmp"
+        die "I could not set file permissions safely."
+    end
+
+    mv -f "$tmp" "$path" >> "$LOG_FILE" 2>&1
+    or begin
+        rm -f "$tmp"
+        die "I could not finish a safe file update."
+    end
+end
+
+function rewrite_key_value_file
+    set -l path $argv[1]
+    set -l owner $argv[2]
+    set -l group $argv[3]
+    set -l mode $argv[4]
+    set -l key $argv[5]
+    set -l value $argv[6]
+    set -l dir (dirname "$path")
+    set -l tmp (mktemp "$dir/.tonkineseBSD.kv.XXXXXX")
+    or die "I could not prepare a safe temporary file."
+
+    if test -e "$path"
+        awk -v key="$key" '
+            BEGIN {
+                pattern = "^[[:space:]]*" key "[[:space:]]*="
+            }
+            $0 ~ pattern { next }
+            { print }
+        ' "$path" > "$tmp"
+        or begin
+            rm -f "$tmp"
+            die "I could not prepare a safe file update."
+        end
+    else
+        : > "$tmp"
+        or begin
+            rm -f "$tmp"
+            die "I could not prepare a safe file update."
+        end
+    end
+
+    printf '%s\n' "$key=$value" >> "$tmp"
+    or begin
+        rm -f "$tmp"
+        die "I could not prepare a safe file update."
+    end
+
+    if test -e "$path"
+        if cmp -s "$tmp" "$path"
+            chown "$owner:$group" "$path" >> "$LOG_FILE" 2>&1
+            chmod "$mode" "$path" >> "$LOG_FILE" 2>&1
+            rm -f "$tmp"
+            return 0
+        end
+        backup_file "$path"
+    end
+
+    chown "$owner:$group" "$tmp" >> "$LOG_FILE" 2>&1
+    or begin
+        rm -f "$tmp"
+        die "I could not set file ownership safely."
+    end
+
+    chmod "$mode" "$tmp" >> "$LOG_FILE" 2>&1
+    or begin
+        rm -f "$tmp"
+        die "I could not set file permissions safely."
+    end
+
+    mv -f "$tmp" "$path" >> "$LOG_FILE" 2>&1
+    or begin
+        rm -f "$tmp"
+        die "I could not finish a safe file update."
+    end
+end
+
+function is_human_user
+    set -l user $argv[1]
+
+    if test -z "$user"
+        return 1
+    end
+
+    if not id "$user" >/dev/null 2>>"$LOG_FILE"
+        return 1
+    end
+
+    if test "$user" = root
+        return 1
+    end
+
+    set -l uid (id -u "$user" 2>>"$LOG_FILE")
+    if test "$uid" -lt 1000
+        return 1
+    end
+
+    return 0
+end
+
+function first_console_user
+    who 2>>"$LOG_FILE" | awk '$2 ~ /^ttyC/ {print $1; exit}'
+end
+
+function first_regular_user
+    awk -F: '$3 >= 1000 && $1 != "root" && $1 != "nobody" && $7 !~ /(nologin|false)$/ {print $1; exit}' /etc/passwd
+end
+
+function determine_target_user
+    for cand in $DOAS_USER $SUDO_USER (first_console_user) (logname 2>/dev/null) (first_regular_user)
+        if is_human_user "$cand"
+            echo "$cand"
+            return 0
+        end
+    end
+
+    return 1
+end
+
+function resolve_pkg_exact
+    set -l stem $argv[1]
+    set -l matches (pkg_info -Q "$stem" 2>>"$LOG_FILE")
+
+    if test $status -ne 0
+        return 1
+    end
+
+    set -l exact (printf '%s\n' $matches | awk -v stem="$stem" 'index($0, stem "-") == 1 { print; exit }')
+    if test -n "$exact"
+        echo "$exact"
+        return 0
+    end
+
+    set exact (printf '%s\n' $matches | head -n 1)
+    if test -n "$exact"
+        echo "$exact"
+        return 0
+    end
+
+    return 1
+end
+
+function ensure_role
+    set -l role $argv[1]
+    set -l critical $argv[2]
+    set -l friendly $argv[3]
+    set -l candidates $argv[4..-1]
+
+    for stem in $candidates
+        if pkg_info -e "$stem-*" >/dev/null 2>>"$LOG_FILE"
+            log_internal "ROLE $role already satisfied by $stem"
+            echo "$stem"
+            return 0
+        end
+    end
+
+    for stem in $candidates
+        set -l exact (resolve_pkg_exact "$stem")
+        if test -z "$exact"
+            continue
+        end
+
+        say "$friendly"
+        if retry_run 3 3 "$friendly" -- pkg_add "$exact"
+            if pkg_info -e "$stem-*" >/dev/null 2>>"$LOG_FILE"
+                log_internal "ROLE $role installed stem=$stem exact=$exact"
+                echo "$stem"
+                return 0
+            end
+            log_internal "ROLE $role verification failed stem=$stem exact=$exact"
+        end
+    end
+
+    if test "$critical" = critical
+        die "I could not finish installing everything needed."
+    end
+
+    log_internal "ROLE $role optional unavailable or failed"
+    return 1
+end
+
+function ensure_service_ready
+    set -l service $argv[1]
+    set -l friendly $argv[2]
+
+    say "$friendly"
+
+    retry_run 2 2 "$friendly" -- rcctl enable "$service"
+    or die "I could not finish a needed background service."
+
+    retry_run 2 2 "$friendly" -- rcctl start "$service"
+    or begin
+        if not rcctl check "$service" >/dev/null 2>>"$LOG_FILE"
+            die "I could not start everything that is needed."
+        end
+    end
+end
+
+function refresh_firmware
+    say "Checking hardware support"
+    retry_run 3 3 "Checking hardware support" -- fw_update
+    or die "I could not finish preparing the machine hardware."
+end
+
+function apply_runtime_sysctl
+    set -l key $argv[1]
+    set -l value $argv[2]
+    retry_run 2 1 "Applying a system setting" -- sysctl "$key=$value"
+    or die "I could not apply a needed system setting."
+end
+
+function ensure_persistent_sysctl
+    set -l key $argv[1]
+    set -l value $argv[2]
+    rewrite_key_value_file /etc/sysctl.conf root wheel 0644 "$key" "$value"
+end
+
+function prepare_recording_support
+    say "Getting sound and camera access ready"
+    apply_runtime_sysctl kern.audio.record 1
+    apply_runtime_sysctl kern.video.record 1
+    ensure_persistent_sysctl kern.audio.record 1
+    ensure_persistent_sysctl kern.video.record 1
+end
+
+function write_managed_xresources
+    set -l path "$TARGET_HOME/.config/tonkineseBSD/Xresources"
+
+    begin
+        printf '%s\n' '! Managed by tonkineseBSD'
+        printf '%s\n' 'XTerm*faceName: monospace:size=10'
+        printf '%s\n' 'XTerm*utf8: 2'
+        printf '%s\n' 'XTerm*saveLines: 5000'
+        printf '%s\n' 'XTerm*scrollBar: false'
+        printf '%s\n' 'XTerm*background: #101417'
+        printf '%s\n' 'XTerm*foreground: #e6e6e6'
+        printf '%s\n' 'XTerm*cursorColor: #8fb7ff'
+        printf '%s\n' 'XTerm*pointerColorBackground: #101417'
+        printf '%s\n' 'XTerm*pointerColorForeground: #e6e6e6'
+        printf '%s\n' 'XTerm*metaSendsEscape: true'
+        printf '%s\n' 'XTerm*selectToClipboard: true'
+    end | atomic_write_from_stdin "$path" "$TARGET_USER" "$TARGET_GROUP" 0644
+end
+
+function write_managed_xsession
+    set -l path "$TARGET_HOME/.xsession"
+
+    begin
+        printf '%s\n' "#!$FISH_BIN"
+        printf '%s\n' '# Managed by tonkineseBSD'
+        printf '%s\n' 'set -gx PATH /usr/local/bin /usr/X11R6/bin /bin /usr/bin /sbin /usr/sbin'
+        printf '%s\n' 'set -gx AUDIODEVICE snd/default'
+        printf '%s\n' 'umask 022'
+        printf '%s\n' 'if test -r "$HOME/.config/tonkineseBSD/Xresources"'
+        printf '%s\n' '    xrdb -merge "$HOME/.config/tonkineseBSD/Xresources" >/dev/null 2>&1'
+        printf '%s\n' 'end'
+        printf '%s\n' 'if test -r "$HOME/.Xresources.local"'
+        printf '%s\n' '    xrdb -merge "$HOME/.Xresources.local" >/dev/null 2>&1'
+        printf '%s\n' 'end'
+        printf '%s\n' 'if command -sq xdg-user-dirs-update'
+        printf '%s\n' '    xdg-user-dirs-update >/dev/null 2>&1'
+        printf '%s\n' 'end'
+        printf '%s\n' 'if command -sq xrandr'
+        printf '%s\n' '    xrandr --auto >/dev/null 2>&1'
+        printf '%s\n' 'end'
+        printf '%s\n' 'if command -sq sndioctl'
+        printf '%s\n' '    set -l current_level (sndioctl -n output.level 2>/dev/null)'
+        printf '%s\n' '    if test -n "$current_level"'
+        printf '%s\n' '        if string match -rq "^0(\.0+)?$" -- "$current_level"'
+        printf '%s\n' '            sndioctl -q output.level=0.80 >/dev/null 2>&1'
+        printf '%s\n' '        end'
+        printf '%s\n' '    end'
+        printf '%s\n' 'end'
+        printf '%s\n' 'xsetroot -solid "#1e232b" >/dev/null 2>&1'
+        printf '%s\n' 'exec emwm'
+    end | atomic_write_from_stdin "$path" "$TARGET_USER" "$TARGET_GROUP" 0755
+end
+
+function assert_pkg_installed
+    set -l stem $argv[1]
+
+    if test -z "$stem"
+        return 0
+    end
+
+    if not pkg_info -e "$stem-*" >/dev/null 2>>"$LOG_FILE"
+        die "I stopped because part of the desktop is still missing."
+    end
+end
+
+function assert_owner
+    set -l path $argv[1]
+    set -l expected_user $argv[2]
+
+    set -l actual_user (stat -f %Su "$path" 2>>"$LOG_FILE")
+    if test "$actual_user" != "$expected_user"
+        die "I stopped because a user file ended up with the wrong ownership."
+    end
+end
+
+function wait_for_xorg_log
+    set -l tries 15
+    while test "$tries" -gt 0
+        if test -f /var/log/Xorg.0.log
+            return 0
+        end
+        sleep 1
+        set tries (math "$tries - 1")
+    end
+    return 1
+end
+
+function validate_audio_stack
+    set -l device ""
+
+    for cand in /dev/audioctl0 /dev/audioctl1 /dev/audio0 /dev/audio1
+        if test -c "$cand"
+            set device "$cand"
+            break
+        end
+    end
+
+    if test -z "$device"
+        die "I stopped because no sound device became available."
+    end
+
+    if string match -rq 'audioctl' -- "$device"
+        if not audioctl -f "$device" >/dev/null 2>>"$LOG_FILE"
+            die "I stopped because sound did not become ready."
+        end
+    end
+
+    set -l audio_record (sysctl -n kern.audio.record 2>>"$LOG_FILE")
+    if test "$audio_record" != 1
+        die "I stopped because microphone access is still blocked."
+    end
+end
+
+function validate_video_stack
+    if not wait_for_xorg_log
+        die "I stopped because the graphics system did not become ready."
+    end
+
+    if grep -Eiq 'no screens found|Fatal server error' /var/log/Xorg.0.log 2>>"$LOG_FILE"
+        die "I stopped because the graphics system reported a serious problem."
+    end
+
+    set -l video_record (sysctl -n kern.video.record 2>>"$LOG_FILE")
+    if test "$video_record" != 1
+        die "I stopped because camera access is still blocked."
+    end
+end
+
+function final_validation
+    assert_pkg_installed "$PKG_EMWM_STEM"
+    assert_pkg_installed "$PKG_BROWSER_STEM"
+    assert_pkg_installed "$PKG_FILE_MANAGER_STEM"
+    assert_pkg_installed "$PKG_IMAGE_STEM"
+    assert_pkg_installed "$PKG_PDF_STEM"
+    assert_pkg_installed "$PKG_MEDIA_STEM"
+    assert_pkg_installed "$PKG_TERMINAL_STEM"
+
+    if not test -x "$TARGET_HOME/.xsession"
+        die "I stopped because the desktop start file is not ready."
+    end
+
+    if not grep -q 'exec emwm' "$TARGET_HOME/.xsession" 2>>"$LOG_FILE"
+        die "I stopped because the desktop session is not pointing to emwm."
+    end
+
+    if not test -r "$TARGET_HOME/.config/tonkineseBSD/Xresources"
+        die "I stopped because the desktop defaults are missing."
+    end
+
+    assert_owner "$TARGET_HOME/.xsession" "$TARGET_USER"
+    assert_owner "$TARGET_HOME/.config/tonkineseBSD/Xresources" "$TARGET_USER"
+
+    set -l xenodm_status (rcctl get xenodm status 2>>"$LOG_FILE")
+    if test "$xenodm_status" != on
+        die "I stopped because the login screen is not enabled."
+    end
+
+    if not rcctl check xenodm >/dev/null 2>>"$LOG_FILE"
+        die "I stopped because the login screen is not running correctly."
+    end
+
+    set -l sndiod_status (rcctl get sndiod status 2>>"$LOG_FILE")
+    if test "$sndiod_status" != on
+        die "I stopped because sound is not enabled the way it should be."
+    end
+
+    if not rcctl check sndiod >/dev/null 2>>"$LOG_FILE"
+        die "I stopped because sound is not running correctly."
+    end
+
+    validate_audio_stack
+    validate_video_stack
+end
+
+function main
+    prechecks
+    ensure_root $argv
+    prechecks
+
+    set -g FISH_BIN (command -s fish 2>/dev/null)
+    if test -z "$FISH_BIN"
+        die "I could not continue because the shell for this setup is missing."
+    end
+
+    set -g TARGET_USER (determine_target_user)
+    if test -z "$TARGET_USER"
+        die "I could not safely determine which account should receive the desktop setup."
+    end
+
+    set -g TARGET_HOME (id -P "$TARGET_USER" | awk -F: '{print $9}')
+    set -g TARGET_GROUP (id -gn "$TARGET_USER")
+
+    if test -z "$TARGET_HOME"
+        die "I could not safely determine the home folder for the desktop user."
+    end
+
+    if not test -d "$TARGET_HOME"
+        die "I could not safely determine the home folder for the desktop user."
+    end
+
+    log_internal "TARGET_USER=$TARGET_USER TARGET_HOME=$TARGET_HOME TARGET_GROUP=$TARGET_GROUP"
+
+    set -g PKG_EMWM_STEM (ensure_role emwm critical "Installing the main desktop pieces" emwm)
+    set -g PKG_TERMINAL_STEM (ensure_role terminal critical "Adding a comfortable terminal" xfce4-terminal)
+    set -g PKG_BROWSER_STEM (ensure_role browser critical "Adding a web browser" firefox-esr mozilla-firefox)
+    set -g PKG_FILE_MANAGER_STEM (ensure_role files critical "Adding file browsing" thunar pcmanfm-qt)
+    set -g PKG_IMAGE_STEM (ensure_role images critical "Adding image viewing" nsxiv feh)
+    set -g PKG_PDF_STEM (ensure_role pdf critical "Adding PDF viewing" mupdf xpdf)
+    set -g PKG_MEDIA_STEM (ensure_role media critical "Adding media playback" mpv mplayer)
+    set -g PKG_ARCHIVE_STEM (ensure_role archive optional "Adding everyday tools" xarchiver)
+    set -g PKG_CLIPBOARD_STEM (ensure_role clipboard optional "Adding clipboard support" xclip)
+    set -g PKG_XDG_STEM (ensure_role xdg optional "Adding desktop helpers" xdg-utils)
+    set -g PKG_XDG_DIRS_STEM (ensure_role xdgdirs optional "Adding home folders" xdg-user-dirs)
+    set -g PKG_FONTS_STEM (ensure_role fonts optional "Adding comfortable fonts" noto-fonts)
+    set -g PKG_FONTSCJK_STEM (ensure_role fontscjk optional "Adding more fonts" noto-cjk)
+
+    refresh_firmware
+    prepare_recording_support
+
+    ensure_service_ready sndiod "Getting sound ready"
+    ensure_service_ready xenodm "Finishing your login screen"
+
+    ensure_dir "$TARGET_HOME/.config" "$TARGET_USER" "$TARGET_GROUP" 0755
+    ensure_dir "$TARGET_HOME/.config/tonkineseBSD" "$TARGET_USER" "$TARGET_GROUP" 0755
+
+    for folder in Desktop Documents Downloads Music Pictures Videos
+        ensure_dir "$TARGET_HOME/$folder" "$TARGET_USER" "$TARGET_GROUP" 0755
+    end
+
+    say "Making everything start correctly"
+    write_managed_xresources
+    write_managed_xsession
+
+    say "Cleaning up and checking the result"
+    final_validation
+
+    printf '%s\n' ''
+    printf '%s\n' 'Your desktop is ready.'
+    printf '%s\n' "Log file: $LOG_FILE"
+end
+
+main $argv
